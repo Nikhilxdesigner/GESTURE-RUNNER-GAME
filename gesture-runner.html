@@ -1,0 +1,753 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Runway — Hand-Tracked Runner</title>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+<style>
+  :root{
+    --ink:#12141f;
+    --panel:#1b1e2d;
+    --panel-line:#2c3046;
+    --amber:#f2a93b;
+    --amber-dim:#7a5a26;
+    --teal:#3fbfb0;
+    --red:#e2564f;
+    --paper:#e9e6de;
+    --paper-dim:#a7a49a;
+    --mono:'IBM Plex Mono','Courier New',monospace;
+    --grot:'Archivo','Arial Narrow',sans-serif;
+  }
+  *{box-sizing:border-box;}
+  html,body{
+    margin:0;padding:0;height:100%;
+    background:var(--ink);
+    color:var(--paper);
+    font-family:var(--grot);
+    overflow:hidden;
+  }
+  #stage{
+    position:relative;
+    width:100vw;height:100vh;
+    display:flex;align-items:center;justify-content:center;
+  }
+  #frame{
+    position:relative;
+    width:min(96vw, 900px);
+    aspect-ratio: 4 / 3;
+    background:var(--panel);
+    border:1px solid var(--panel-line);
+    border-radius:6px;
+    overflow:hidden;
+    box-shadow:0 40px 80px -30px rgba(0,0,0,.7);
+  }
+  canvas#game{
+    position:absolute;inset:0;
+    width:100%;height:100%;
+    display:block;
+  }
+  /* corner viewfinder brackets on the whole frame */
+  #frame::before, #frame::after,
+  .br-tl,.br-tr,.br-bl,.br-br{
+    content:'';position:absolute;width:22px;height:22px;
+    border-color:var(--amber);border-style:solid;opacity:.75;
+    pointer-events:none;z-index:5;
+  }
+  .br-tl{top:10px;left:10px;border-width:2px 0 0 2px;}
+  .br-tr{top:10px;right:10px;border-width:2px 2px 0 0;}
+  .br-bl{bottom:10px;left:10px;border-width:0 0 2px 2px;}
+  .br-br{bottom:10px;right:10px;border-width:0 2px 2px 0;}
+  #frame::before,#frame::after{display:none;}
+
+  /* camera preview, small, top-right, mirrored */
+  #camwrap{
+    position:absolute;top:14px;right:14px;
+    width:132px;height:99px;
+    border:1px solid var(--panel-line);
+    border-radius:4px;
+    overflow:hidden;
+    background:#000;
+    z-index:6;
+  }
+  #camwrap span{
+    position:absolute;bottom:3px;left:5px;
+    font-family:var(--mono);font-size:9px;letter-spacing:.06em;
+    color:var(--teal);text-transform:uppercase;
+    z-index:2;
+  }
+  video{
+    position:absolute;inset:0;width:100%;height:100%;object-fit:cover;
+    transform:scaleX(-1);opacity:0;
+  }
+  canvas#overlay{
+    position:absolute;inset:0;width:100%;height:100%;
+    transform:scaleX(-1);
+  }
+
+  /* HUD */
+  #hud{
+    position:absolute;top:14px;left:14px;z-index:6;
+    font-family:var(--mono);
+    display:flex;flex-direction:column;gap:6px;
+  }
+  #hud .score{
+    font-size:28px;color:var(--paper);font-weight:600;
+    letter-spacing:.02em;
+  }
+  #hud .score sup{font-size:11px;color:var(--paper-dim);font-weight:400;margin-left:6px;}
+  #status-pill{
+    display:inline-flex;align-items:center;gap:6px;
+    font-size:10px;letter-spacing:.08em;text-transform:uppercase;
+    color:var(--paper-dim);
+    padding:3px 8px;border:1px solid var(--panel-line);border-radius:20px;
+    width:fit-content;
+  }
+  #status-pill .dot{width:6px;height:6px;border-radius:50%;background:var(--paper-dim);}
+  #status-pill.live .dot{background:var(--teal);box-shadow:0 0 8px var(--teal);}
+  #status-pill.paused .dot{background:var(--amber);box-shadow:0 0 8px var(--amber);}
+  #status-pill.live{color:var(--teal);}
+  #status-pill.paused{color:var(--amber);}
+
+  /* gesture legend bottom-left */
+  #legend{
+    position:absolute;bottom:14px;left:14px;z-index:6;
+    font-family:var(--mono);font-size:10px;color:var(--paper-dim);
+    display:flex;flex-direction:column;gap:4px;
+    opacity:.85;
+  }
+  #legend div{display:flex;gap:8px;align-items:center;}
+  #legend .k{color:var(--paper);min-width:64px;display:inline-block;}
+
+  /* quit hold radial */
+  #quitring{
+    position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);
+    width:120px;height:120px;z-index:8;display:none;
+  }
+  #quitring svg{width:100%;height:100%;transform:rotate(-90deg);}
+  #quitring circle{fill:none;stroke-width:5;}
+  #quitring .bg{stroke:rgba(255,255,255,.12);}
+  #quitring .fg{stroke:var(--red);stroke-linecap:round;transition:stroke-dashoffset .05s linear;}
+  #quitring .lbl{
+    position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
+    font-family:var(--mono);font-size:10px;color:var(--red);letter-spacing:.06em;
+    text-transform:uppercase;text-align:center;
+  }
+
+  /* overlays: start / paused / gameover */
+  .overlay{
+    position:absolute;inset:0;z-index:7;
+    display:flex;align-items:center;justify-content:center;
+    background:rgba(14,15,23,.88);
+    backdrop-filter:blur(2px);
+    text-align:center;
+    padding:24px;
+  }
+  .overlay.hidden{display:none;}
+  .panel-inner{max-width:420px;}
+  h1{
+    font-size:34px;margin:0 0 6px;letter-spacing:-.01em;font-weight:700;
+    color:var(--paper);
+  }
+  h1 em{font-style:normal;color:var(--amber);}
+  .sub{color:var(--paper-dim);font-size:14px;margin:0 0 22px;line-height:1.5;}
+  .gestures{
+    display:grid;grid-template-columns:1fr 1fr;gap:10px;
+    margin-bottom:24px;text-align:left;
+  }
+  .gcard{
+    border:1px solid var(--panel-line);border-radius:5px;padding:10px 12px;
+    background:rgba(255,255,255,.02);
+  }
+  .gcard .g-name{font-size:12px;color:var(--teal);font-family:var(--mono);letter-spacing:.02em;}
+  .gcard .g-desc{font-size:12px;color:var(--paper-dim);margin-top:3px;line-height:1.4;}
+  button{
+    font-family:var(--grot);font-weight:600;font-size:14px;
+    background:var(--amber);color:#241a05;border:none;
+    padding:12px 26px;border-radius:4px;cursor:pointer;
+    letter-spacing:.01em;
+    transition:transform .1s ease, background .15s ease;
+  }
+  button:hover{background:#f6ba5c;}
+  button:active{transform:scale(.97);}
+  button.secondary{
+    background:transparent;border:1px solid var(--panel-line);color:var(--paper);
+    margin-left:10px;
+  }
+  button.secondary:hover{border-color:var(--amber);color:var(--amber);background:transparent;}
+  .cam-error{color:var(--red);font-size:12px;margin-top:14px;font-family:var(--mono);display:none;}
+  .final-score{font-size:52px;font-weight:700;color:var(--amber);margin:6px 0 0;font-family:var(--mono);}
+  .final-score-label{font-size:11px;color:var(--paper-dim);text-transform:uppercase;letter-spacing:.1em;}
+  .kb-hint{
+    margin-top:18px;font-size:11px;color:var(--paper-dim);font-family:var(--mono);
+  }
+  .kb-hint kbd{
+    background:rgba(255,255,255,.06);border:1px solid var(--panel-line);
+    border-radius:3px;padding:1px 6px;font-family:var(--mono);
+  }
+  #calib{
+    position:absolute;bottom:14px;right:14px;z-index:6;
+    font-family:var(--mono);font-size:9px;color:var(--paper-dim);
+    text-align:right;line-height:1.5;
+  }
+  #calib b{color:var(--paper);}
+</style>
+</head>
+<body>
+
+<div id="stage">
+  <div id="frame">
+    <canvas id="game"></canvas>
+
+    <div class="br-tl"></div><div class="br-tr"></div><div class="br-bl"></div><div class="br-br"></div>
+
+    <div id="hud">
+      <div class="score"><span id="scoreVal">0</span><sup>DIST</sup></div>
+      <div id="status-pill"><span class="dot"></span><span id="statusText">idle</span></div>
+    </div>
+
+    <div id="legend">
+      <div><span class="k">SWIPE HAND</span> change lane</div>
+      <div><span class="k">3 FINGERS</span> pause / resume</div>
+      <div><span class="k">BOTH HANDS UP</span> hold to quit</div>
+    </div>
+
+    <div id="calib"><b id="handsCount">0</b> hand(s) tracked<br/><span id="fpsTag">-- fps</span></div>
+
+    <div id="camwrap">
+      <video id="video" playsinline></video>
+      <canvas id="overlay"></canvas>
+      <span>TRACK</span>
+    </div>
+
+    <div id="quitring">
+      <svg viewBox="0 0 120 120">
+        <circle class="bg" cx="60" cy="60" r="52"></circle>
+        <circle class="fg" id="quitArc" cx="60" cy="60" r="52" stroke-dasharray="327" stroke-dashoffset="327"></circle>
+      </svg>
+      <div class="lbl">Quitting…</div>
+    </div>
+
+    <!-- START -->
+    <div class="overlay" id="overlayStart">
+      <div class="panel-inner">
+        <h1>Run<em>way</em></h1>
+        <p class="sub">A three-lane runner steered entirely by your hand. Show the camera your palm and get moving.</p>
+        <div class="gestures">
+          <div class="gcard"><div class="g-name">SWIPE →</div><div class="g-desc">move a hand right → player shifts one lane right</div></div>
+          <div class="gcard"><div class="g-name">SWIPE ←</div><div class="g-desc">move a hand left → player shifts one lane left</div></div>
+          <div class="gcard"><div class="g-name">✌ + 1 = 3 FINGERS</div><div class="g-desc">hold up index, middle &amp; ring → pause / resume</div></div>
+          <div class="gcard"><div class="g-name">BOTH HANDS UP</div><div class="g-desc">raise both hands overhead and hold → quits the run</div></div>
+        </div>
+        <button id="btnStart">Enable camera &amp; start</button>
+        <div class="cam-error" id="camError">Couldn't access the camera. Check the browser's permission prompt and reload.</div>
+        <div class="kb-hint">No camera handy? Use <kbd>←</kbd> <kbd>→</kbd> to move, <kbd>Space</kbd> to pause, <kbd>Esc</kbd> to quit.</div>
+      </div>
+    </div>
+
+    <!-- PAUSED -->
+    <div class="overlay hidden" id="overlayPause">
+      <div class="panel-inner">
+        <h1 style="font-size:26px">Paused</h1>
+        <p class="sub">Hold up three fingers again, or press Space, to resume.</p>
+        <button id="btnResume">Resume</button>
+        <button class="secondary" id="btnQuitFromPause">Quit</button>
+      </div>
+    </div>
+
+    <!-- GAME OVER -->
+    <div class="overlay hidden" id="overlayOver">
+      <div class="panel-inner">
+        <h1 style="font-size:26px">Run over</h1>
+        <div class="final-score-label">distance</div>
+        <div class="final-score" id="finalScore">0</div>
+        <div style="margin-top:26px">
+          <button id="btnRestart">Run again</button>
+          <button class="secondary" id="btnQuitFromOver">Exit</button>
+        </div>
+      </div>
+    </div>
+
+  </div>
+</div>
+
+<script>
+(() => {
+  "use strict";
+
+  /* ---------------------------------------------------------------
+     DOM refs
+  ----------------------------------------------------------------*/
+  const gameCanvas   = document.getElementById('game');
+  const gctx         = gameCanvas.getContext('2d');
+  const video        = document.getElementById('video');
+  const overlay      = document.getElementById('overlay');
+  const octx         = overlay.getContext('2d');
+  const frame        = document.getElementById('frame');
+
+  const scoreVal      = document.getElementById('scoreVal');
+  const statusPill     = document.getElementById('status-pill');
+  const statusText     = document.getElementById('statusText');
+  const handsCountEl   = document.getElementById('handsCount');
+  const fpsTag         = document.getElementById('fpsTag');
+  const quitring       = document.getElementById('quitring');
+  const quitArc        = document.getElementById('quitArc');
+
+  const overlayStart   = document.getElementById('overlayStart');
+  const overlayPause   = document.getElementById('overlayPause');
+  const overlayOver    = document.getElementById('overlayOver');
+  const camError       = document.getElementById('camError');
+  const finalScoreEl   = document.getElementById('finalScore');
+
+  const btnStart          = document.getElementById('btnStart');
+  const btnResume         = document.getElementById('btnResume');
+  const btnQuitFromPause  = document.getElementById('btnQuitFromPause');
+  const btnRestart        = document.getElementById('btnRestart');
+  const btnQuitFromOver   = document.getElementById('btnQuitFromOver');
+
+  /* ---------------------------------------------------------------
+     Game state machine: IDLE -> RUNNING <-> PAUSED, RUNNING -> OVER
+  ----------------------------------------------------------------*/
+  const STATE = { IDLE:'idle', RUNNING:'running', PAUSED:'paused', OVER:'over' };
+  let state = STATE.IDLE;
+
+  const LANES = 3;
+  let laneX = [];         // pixel centers, computed on resize
+  let laneW = 0;
+
+  const player = { lane: 1, x: 0, y: 0, w: 46, h: 46, drawX: 0 };
+  let obstacles = [];      // {lane, y, w, h}
+  let particles = [];      // simple burst on collision
+  let roadDashOffset = 0;
+
+  let speed = 260;          // px/sec, ramps up
+  let spawnTimer = 0;
+  let spawnInterval = 1.15; // seconds, ramps down
+  let elapsed = 0;
+  let score = 0;
+  let lastTs = 0;
+
+  /* ---------------------------------------------------------------
+     Gesture state — written by the MediaPipe callback, read by the
+     game loop. Decoupling detection from rendering keeps input
+     latency independent of render framerate.
+  ----------------------------------------------------------------*/
+  const gesture = {
+    pendingLaneDelta: 0,     // consumed once per game-loop tick
+    lastSwipeAt: 0,
+    swipeCooldownMs: 420,
+    wristHistory: [],        // {x,t} of the primary hand's wrist, ~300ms window
+    threeFingerHoldStart: 0,
+    threeFingerCooldownUntil: 0,
+    bothHandsHoldStart: 0,
+    handsPresent: 0,
+  };
+
+  const QUIT_HOLD_MS   = 1100;
+  const PAUSE_HOLD_MS  = 380;
+  const SWIPE_WINDOW_MS = 260;
+  const SWIPE_THRESHOLD = 0.16; // normalized x movement across the window
+
+  /* ---------------------------------------------------------------
+     Resize / layout
+  ----------------------------------------------------------------*/
+  function layout() {
+    const rect = frame.getBoundingClientRect();
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    gameCanvas.width  = rect.width * dpr;
+    gameCanvas.height = rect.height * dpr;
+    gctx.setTransform(dpr,0,0,dpr,0,0);
+
+    overlay.width  = 132; overlay.height = 99;
+
+    const w = rect.width, h = rect.height;
+    laneW = w / LANES;
+    laneX = [0,1,2].map(i => laneW * i + laneW/2);
+    player.y = h - 96;
+    player.x = laneX[player.lane];
+    player.drawX = player.x;
+  }
+  window.addEventListener('resize', layout);
+
+  /* ---------------------------------------------------------------
+     Game reset / lifecycle
+  ----------------------------------------------------------------*/
+  function resetGame() {
+    obstacles = [];
+    particles = [];
+    speed = 260;
+    spawnInterval = 1.15;
+    spawnTimer = 0;
+    elapsed = 0;
+    score = 0;
+    player.lane = 1;
+    layout();
+    scoreVal.textContent = '0';
+  }
+
+  function setState(next) {
+    state = next;
+    overlayStart.classList.toggle('hidden', state !== STATE.IDLE);
+    overlayPause.classList.toggle('hidden', state !== STATE.PAUSED);
+    overlayOver.classList.toggle('hidden', state !== STATE.OVER);
+
+    statusPill.classList.remove('live','paused');
+    if (state === STATE.RUNNING) { statusPill.classList.add('live'); statusText.textContent = 'live'; }
+    else if (state === STATE.PAUSED) { statusPill.classList.add('paused'); statusText.textContent = 'paused'; }
+    else if (state === STATE.OVER) { statusText.textContent = 'run over'; }
+    else { statusText.textContent = 'idle'; }
+  }
+
+  function startRun() {
+    resetGame();
+    setState(STATE.RUNNING);
+    lastTs = performance.now();
+    requestAnimationFrame(loop);
+  }
+
+  function endRun() {
+    setState(STATE.OVER);
+    finalScoreEl.textContent = String(score);
+  }
+
+  function quitToStart() {
+    setState(STATE.IDLE);
+    quitring.style.display = 'none';
+    gesture.bothHandsHoldStart = 0;
+  }
+
+  function togglePause() {
+    if (state === STATE.RUNNING) {
+      setState(STATE.PAUSED);
+    } else if (state === STATE.PAUSED) {
+      setState(STATE.RUNNING);
+      lastTs = performance.now();
+      requestAnimationFrame(loop);
+    }
+  }
+
+  /* ---------------------------------------------------------------
+     Obstacle spawning
+  ----------------------------------------------------------------*/
+  function spawnRow() {
+    const blockedCount = Math.random() < 0.35 ? 2 : 1; // never fully block the road
+    const lanes = [0,1,2].sort(() => Math.random() - 0.5).slice(0, blockedCount);
+    lanes.forEach(l => obstacles.push({ lane: l, y: -60, w: laneW*0.6, h: 34 }));
+  }
+
+  function burst(x, y, color) {
+    for (let i=0;i<18;i++){
+      particles.push({
+        x, y,
+        vx: (Math.random()-0.5)*360,
+        vy: (Math.random()-0.9)*360,
+        life: 0.6 + Math.random()*0.3,
+        age: 0,
+        color
+      });
+    }
+  }
+
+  /* ---------------------------------------------------------------
+     Main loop
+  ----------------------------------------------------------------*/
+  function loop(ts) {
+    if (state !== STATE.RUNNING) return; // pause/quit/over halts the RAF chain
+    const dt = Math.min((ts - lastTs)/1000, 0.05);
+    lastTs = ts;
+    elapsed += dt;
+
+    // consume any queued gesture lane-change
+    if (gesture.pendingLaneDelta !== 0) {
+      player.lane = Math.max(0, Math.min(LANES-1, player.lane + gesture.pendingLaneDelta));
+      gesture.pendingLaneDelta = 0;
+    }
+    player.x = laneX[player.lane];
+    player.drawX += (player.x - player.drawX) * Math.min(1, dt*14);
+
+    // difficulty ramp
+    speed = 260 + elapsed*9;
+    spawnInterval = Math.max(0.55, 1.15 - elapsed*0.012);
+
+    spawnTimer += dt;
+    if (spawnTimer >= spawnInterval) { spawnTimer = 0; spawnRow(); }
+
+    roadDashOffset = (roadDashOffset + speed*dt) % 48;
+
+    // move obstacles, check collisions / scoring
+    const rect = frame.getBoundingClientRect();
+    for (let i=obstacles.length-1;i>=0;i--){
+      const o = obstacles[i];
+      o.y += speed*dt;
+      const ox = laneX[o.lane];
+      const hit = o.lane === player.lane &&
+                  o.y + o.h/2 > player.y - player.h/2 &&
+                  o.y - o.h/2 < player.y + player.h/2;
+      if (hit) {
+        burst(player.drawX, player.y, '#e2564f');
+        obstacles.splice(i,1);
+        endRun();
+        renderFrame(rect); // draw the impact frame
+        return;
+      }
+      if (o.y - o.h/2 > rect.height) {
+        obstacles.splice(i,1);
+        score += 1;
+      }
+    }
+
+    // particles
+    for (let i=particles.length-1;i>=0;i--){
+      const p = particles[i];
+      p.age += dt;
+      if (p.age >= p.life) { particles.splice(i,1); continue; }
+      p.x += p.vx*dt; p.y += p.vy*dt; p.vy += 500*dt;
+    }
+
+    score += dt*12; // slow continuous distance score
+    scoreVal.textContent = String(Math.floor(score));
+
+    renderFrame(rect);
+    requestAnimationFrame(loop);
+  }
+
+  function renderFrame(rect) {
+    const w = rect.width, h = rect.height;
+    gctx.clearRect(0,0,w,h);
+
+    // road + lane dividers
+    gctx.fillStyle = '#161829';
+    gctx.fillRect(0,0,w,h);
+    gctx.strokeStyle = 'rgba(255,255,255,.08)';
+    gctx.lineWidth = 1;
+    for (let i=1;i<LANES;i++){
+      const x = laneW*i;
+      gctx.setLineDash([10,14]);
+      gctx.lineDashOffset = -roadDashOffset;
+      gctx.beginPath(); gctx.moveTo(x,0); gctx.lineTo(x,h); gctx.stroke();
+    }
+    gctx.setLineDash([]);
+
+    // obstacles
+    obstacles.forEach(o=>{
+      const ox = laneX[o.lane];
+      const grad = gctx.createLinearGradient(ox-o.w/2,o.y-o.h/2,ox+o.w/2,o.y+o.h/2);
+      grad.addColorStop(0,'#e2564f'); grad.addColorStop(1,'#a83a35');
+      gctx.fillStyle = grad;
+      roundRect(gctx, ox-o.w/2, o.y-o.h/2, o.w, o.h, 6);
+      gctx.fill();
+    });
+
+    // player
+    if (state === STATE.RUNNING) {
+      gctx.save();
+      gctx.shadowColor = 'rgba(63,191,176,.55)';
+      gctx.shadowBlur = 18;
+      gctx.fillStyle = '#3fbfb0';
+      roundRect(gctx, player.drawX-player.w/2, player.y-player.h/2, player.w, player.h, 10);
+      gctx.fill();
+      gctx.restore();
+    }
+
+    // particles
+    particles.forEach(p=>{
+      const a = 1 - p.age/p.life;
+      gctx.globalAlpha = Math.max(a,0);
+      gctx.fillStyle = p.color;
+      gctx.fillRect(p.x-3,p.y-3,6,6);
+      gctx.globalAlpha = 1;
+    });
+  }
+
+  function roundRect(ctx,x,y,w,h,r){
+    ctx.beginPath();
+    ctx.moveTo(x+r,y);
+    ctx.arcTo(x+w,y,x+w,y+h,r);
+    ctx.arcTo(x+w,y+h,x,y+h,r);
+    ctx.arcTo(x,y+h,x,y,r);
+    ctx.arcTo(x,y,x+w,y,r);
+    ctx.closePath();
+  }
+
+  /* ---------------------------------------------------------------
+     Hand tracking — MediaPipe Hands
+  ----------------------------------------------------------------*/
+  const FINGER_TIPS = [8,12,16,20];
+  const FINGER_PIPS = [6,10,14,18];
+
+  function countExtendedFingers(lm) {
+    let n = 0;
+    for (let i=0;i<4;i++){
+      if (lm[FINGER_TIPS[i]].y < lm[FINGER_PIPS[i]].y - 0.02) n++;
+    }
+    return n;
+  }
+
+  function isHandRaised(lm) {
+    // wrist and most fingertips in the upper part of the frame
+    return lm[0].y < 0.4;
+  }
+
+  let lastFrameTime = performance.now();
+  let smoothedFps = 0;
+
+  function onResults(results) {
+    const now = performance.now();
+    const dtMs = now - lastFrameTime;
+    lastFrameTime = now;
+    smoothedFps = smoothedFps ? smoothedFps*0.9 + (1000/dtMs)*0.1 : 1000/dtMs;
+    fpsTag.textContent = `${Math.round(smoothedFps)} fps`;
+
+    drawPreview(results);
+
+    const hands = results.multiHandLandmarks || [];
+    handsCountEl.textContent = String(hands.length);
+    gesture.handsPresent = hands.length;
+
+    if (state !== STATE.RUNNING && state !== STATE.PAUSED) {
+      quitring.style.display = 'none';
+      gesture.bothHandsHoldStart = 0;
+      return;
+    }
+
+    /* ---- Quit: both hands raised, held ---- */
+    if (hands.length === 2 && hands.every(isHandRaised)) {
+      if (!gesture.bothHandsHoldStart) gesture.bothHandsHoldStart = now;
+      const held = now - gesture.bothHandsHoldStart;
+      const pct = Math.min(1, held / QUIT_HOLD_MS);
+      quitring.style.display = 'block';
+      const circumference = 327;
+      quitArc.style.strokeDashoffset = String(circumference * (1 - pct));
+      if (held >= QUIT_HOLD_MS) {
+        quitring.style.display = 'none';
+        gesture.bothHandsHoldStart = 0;
+        quitToStart();
+      }
+      return; // don't also process swipes/pause while quit-holding
+    } else {
+      gesture.bothHandsHoldStart = 0;
+      quitring.style.display = 'none';
+    }
+
+    if (hands.length === 0) { gesture.wristHistory = []; gesture.threeFingerHoldStart = 0; return; }
+
+    /* ---- Pause / resume: exactly one hand, three fingers up, held ---- */
+    if (hands.length === 1 && countExtendedFingers(hands[0]) === 3) {
+      if (!gesture.threeFingerHoldStart) gesture.threeFingerHoldStart = now;
+      const held = now - gesture.threeFingerHoldStart;
+      if (held >= PAUSE_HOLD_MS && now >= gesture.threeFingerCooldownUntil) {
+        togglePause();
+        gesture.threeFingerCooldownUntil = now + 900;
+        gesture.threeFingerHoldStart = 0;
+      }
+    } else {
+      gesture.threeFingerHoldStart = 0;
+    }
+
+    /* ---- Swipe: track primary hand wrist x over a short rolling window ---- */
+    if (state === STATE.RUNNING) {
+      const wrist = hands[0][0];
+      gesture.wristHistory.push({ x: wrist.x, t: now });
+      gesture.wristHistory = gesture.wristHistory.filter(p => now - p.t <= SWIPE_WINDOW_MS);
+
+      if (gesture.wristHistory.length >= 3 && now - gesture.lastSwipeAt > gesture.swipeCooldownMs) {
+        const first = gesture.wristHistory[0];
+        const last = gesture.wristHistory[gesture.wristHistory.length-1];
+        const rawDelta = last.x - first.x;       // raw (unmirrored) camera coords
+        const screenDelta = -rawDelta;           // preview is mirrored, so flip sign
+        if (Math.abs(screenDelta) > SWIPE_THRESHOLD) {
+          gesture.pendingLaneDelta = screenDelta > 0 ? 1 : -1;
+          gesture.lastSwipeAt = now;
+          gesture.wristHistory = [];
+        }
+      }
+    }
+  }
+
+  function drawPreview(results) {
+    octx.save();
+    octx.clearRect(0,0,overlay.width, overlay.height);
+    if (results.multiHandLandmarks) {
+      for (const lm of results.multiHandLandmarks) {
+        if (window.drawConnectors && window.HAND_CONNECTIONS) {
+          drawConnectors(octx, lm, HAND_CONNECTIONS, { color: 'rgba(242,169,59,.8)', lineWidth: 1.5 });
+        }
+        if (window.drawLandmarks) {
+          drawLandmarks(octx, lm, { color: '#3fbfb0', radius: 1.6, lineWidth: 0 });
+        }
+      }
+    }
+    octx.restore();
+  }
+
+  let handsModel = null;
+  let camera = null;
+
+  async function initCamera() {
+    handsModel = new Hands({
+      locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`
+    });
+    handsModel.setOptions({
+      maxNumHands: 2,
+      modelComplexity: 1,
+      minDetectionConfidence: 0.7,
+      minTrackingConfidence: 0.6
+    });
+    handsModel.onResults(onResults);
+
+    camera = new Camera(video, {
+      onFrame: async () => { await handsModel.send({ image: video }); },
+      width: 480,
+      height: 360
+    });
+    await camera.start();
+  }
+
+  /* ---------------------------------------------------------------
+     Keyboard fallback (works even without a camera)
+  ----------------------------------------------------------------*/
+  window.addEventListener('keydown', (e) => {
+    if (state === STATE.RUNNING) {
+      if (e.key === 'ArrowRight') gesture.pendingLaneDelta = 1;
+      if (e.key === 'ArrowLeft')  gesture.pendingLaneDelta = -1;
+      if (e.key === ' ')          { e.preventDefault(); togglePause(); }
+      if (e.key === 'Escape')     quitToStart();
+    } else if (state === STATE.PAUSED) {
+      if (e.key === ' ')          { e.preventDefault(); togglePause(); }
+      if (e.key === 'Escape')     quitToStart();
+    } else if (state === STATE.IDLE || state === STATE.OVER) {
+      if (e.key === 'Enter')      btnStart.click();
+    }
+  });
+
+  /* ---------------------------------------------------------------
+     Buttons
+  ----------------------------------------------------------------*/
+  btnStart.addEventListener('click', async () => {
+    btnStart.disabled = true;
+    btnStart.textContent = 'Starting camera…';
+    try {
+      if (!camera) await initCamera();
+      camError.style.display = 'none';
+      startRun();
+    } catch (err) {
+      console.error(err);
+      camError.style.display = 'block';
+    } finally {
+      btnStart.disabled = false;
+      btnStart.textContent = 'Enable camera & start';
+    }
+  });
+  btnResume.addEventListener('click', togglePause);
+  btnQuitFromPause.addEventListener('click', quitToStart);
+  btnRestart.addEventListener('click', startRun);
+  btnQuitFromOver.addEventListener('click', quitToStart);
+
+  layout();
+  setState(STATE.IDLE);
+})();
+</script>
+</body>
+</html>
